@@ -12,6 +12,7 @@
 #include <thrust/extrema.h>
 #include <thrust/iterator/constant_iterator.h>
 #include <thrust/sequence.h>
+#include <thrust/host_vector.h>
 
 #include "loadSaveImage.h"
 #include <stdio.h>
