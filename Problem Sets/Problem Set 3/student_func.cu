@@ -81,6 +81,129 @@
 
 #include "utils.h"
 
+__global__ void reduce_min_kernel(float* d_out, const float* const d_in)
+{
+    extern __shared__ float sdata[];
+
+    int tId = threadIdx.x;
+    int id = tId + blockDim.x * blockIdx.x;
+
+    sdata[tId] = d_in[id];
+    __syncthreads();
+
+    for (unsigned int s = blockDim.x / 2; s > 0; s >>= 1)
+    {
+        if (tId < s)
+        {
+            sdata[tId] = min(sdata[tId], sdata[tId + s]);
+        }
+
+        __syncthreads();
+    }
+
+    if (tId == 0)
+    {
+        d_out[blockIdx.x] = sdata[0];
+    }
+}
+
+__global__ void reduce_max_kernel(float* d_out, const float* const d_in)
+{
+    extern __shared__ float sdata[];
+
+    int tId = threadIdx.x;
+    int id = tId + blockDim.x * blockIdx.x;
+
+    sdata[tId] = d_in[id];
+    __syncthreads();
+
+    for (unsigned int s = blockDim.x / 2; s > 0; s >>= 1)
+    {
+        if (tId < s)
+        {
+            sdata[tId] = max(sdata[tId], sdata[tId + s]);
+        }
+
+        __syncthreads();
+    }
+
+    if (tId == 0)
+    {
+        d_out[blockIdx.x] = sdata[0];
+    }
+}
+
+__global__ void histogram_kernel(unsigned int* d_out, const float* const d_in, const size_t numBins, float logLumRange, float min_logLum)
+{
+    int id = threadIdx.x + blockDim.x * blockIdx.x;
+    int bin = (d_in[id] - min_logLum) / logLumRange * numBins;
+    if (bin == numBins)
+    {
+        bin--;
+    }
+    atomicAdd(&d_out[bin], 1);
+}
+
+__global__ void scan_kernel(unsigned int* d_out, const float* const d_in,
+    const size_t numBins, float logLumRange, float min_logLum)
+{
+    int myId = threadIdx.x + blockDim.x * blockIdx.x;
+    int bin = (d_in[myId] - min_logLum) / logLumRange * numBins;
+    if (bin == numBins)  bin--;
+    atomicAdd(&d_out[bin], 1);
+}
+
+// Hillis Steele Scan - described in lecture
+__global__ void hillis_steele_scan_kernel(unsigned int* d_in, const size_t numBins)
+{
+    int myId = threadIdx.x;
+    for (int d = 1; d < numBins; d *= 2) {
+        if ((myId + 1) % (d * 2) == 0) {
+            d_in[myId] += d_in[myId - d];
+        }
+        __syncthreads();
+    }
+    if (myId == numBins - 1) d_in[myId] = 0;
+    for (int d = numBins / 2; d >= 1; d /= 2) {
+        if ((myId + 1) % (d * 2) == 0) {
+            unsigned int tmp = d_in[myId - d];
+            d_in[myId - d] = d_in[myId];
+            d_in[myId] += tmp;
+        }
+        __syncthreads();
+    }
+}
+
+// Blelloch Scan - described in lecture
+__global__ void blelloch_scan_kernel(unsigned int* d_in, const size_t numBins)
+{
+    int idx = threadIdx.x;
+    extern __shared__ int temp[];
+    int pOut = 0, pIn = 0;
+
+    temp[idx] = (idx > 0) ? d_in[idx - 1] : 0;
+    __syncthreads();
+
+    for (int offset = 1; offset < numBins; offset *= 2)
+    {
+        // swap double buffer indices
+        pOut = 1 - pOut;
+        pIn = 1 - pOut;
+        if (idx >= offset)
+        {
+            temp[pOut * numBins + idx] = temp[pIn * numBins + idx - offset] + temp[pIn * numBins + idx];
+        }
+        else
+        {
+            temp[pOut * numBins + idx] = temp[pIn * numBins + idx];
+        }
+
+        __syncthreads();
+    }
+
+    d_in[idx] = temp[pOut * numBins + idx];
+}
+
 void your_histogram_and_prefixsum(const float* const d_logLuminance,
                                   unsigned int* const d_cdf,
                                   float &min_logLum,
@@ -90,15 +213,46 @@ void your_histogram_and_prefixsum(const float* const d_logLuminance,
                                   const size_t numBins)
 {
   //TODO
-  /*Here are the steps you need to implement
-    1) find the minimum and maximum value in the input logLuminance channel
-       store in min_logLum and max_logLum
-    2) subtract them to find the range
-    3) generate a histogram of all the values in the logLuminance channel using
-       the formula: bin = (lum[i] - lumMin) / lumRange * numBins
-    4) Perform an exclusive scan (prefix sum) on the histogram to get
-       the cumulative distribution of luminance values (this should go in the
-       incoming d_cdf pointer which already has been allocated for you)       */
+  //Here are the steps you need to implement
+  //  1) find the minimum and maximum value in the input logLuminance channel
+  //     store in min_logLum and max_logLum
+    const int size = 1024;
+    int blocks = ceil((float)numCols * numRows / size);
 
+    float* d_intermediate;
+    checkCudaErrors(cudaMalloc(&d_intermediate, sizeof(float) * blocks));
+    float *d_min, *d_max;
+    checkCudaErrors(cudaMalloc((void**)&d_min, sizeof(float)));
+    checkCudaErrors(cudaMalloc((void**)&d_max, sizeof(float)));
 
+    // 1 min per block
+    reduce_min_kernel<<<blocks, size, size * sizeof(float)>>>(d_intermediate, d_logLuminance);
+    // min block
+    reduce_min_kernel<<<1, blocks, blocks * sizeof(float)>>>(d_min, d_intermediate);
+
+    // 1 max per block
+    reduce_max_kernel<<<blocks, size, size * sizeof(float)>>>(d_intermediate, d_logLuminance);
+    // max block
+    reduce_max_kernel<<<1, blocks, blocks * sizeof(float)>>>(d_max, d_intermediate);
+
+    checkCudaErrors(cudaMemcpy(&min_logLum, d_min, sizeof(float), cudaMemcpyDeviceToHost));
+    checkCudaErrors(cudaMemcpy(&max_logLum, d_max, sizeof(float), cudaMemcpyDeviceToHost));
+
+    checkCudaErrors(cudaFree(d_intermediate));
+    checkCudaErrors(cudaFree(d_min));
+    checkCudaErrors(cudaFree(d_max));
+
+  //  2) subtract them to find the range
+    float logLumRange = max_logLum - min_logLum;
+    printf("min_logLum: %f, max_logLum: %f, logLumRange: %f\n", min_logLum, max_logLum, logLumRange);
+
+  //  3) generate a histogram of all the values in the logLuminance channel using
+  //     the formula: bin = (lum[i] - lumMin) / lumRange * numBins
+    checkCudaErrors(cudaMemset(d_cdf, 0, sizeof(unsigned int) * numBins));
+    histogram_kernel<<<blocks, size>>>(d_cdf, d_logLuminance, numBins, logLumRange, min_logLum);
+
+  //  4) Perform an exclusive scan (prefix sum) on the histogram to get
+  //     the cumulative distribution of luminance values (this should go in the
+  //     incoming d_cdf pointer which already has been allocated for you)       
+    blelloch_scan_kernel<<<1, numBins, sizeof(unsigned int) * numBins * 2>>>(d_cdf, numBins);
 }
